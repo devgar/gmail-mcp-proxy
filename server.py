@@ -5,6 +5,7 @@ Flow:
   Claude.ai ──[OAuth]──► This server ──[OAuth]──► Google
   Claude.ai ──[MCP]────► This server ──[Gmail API]──► Gmail/Calendar
 """
+import asyncio
 import base64
 import hashlib
 import os
@@ -28,6 +29,9 @@ GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://mcp.gar.im/gmail
 JWT_SECRET = os.environ["JWT_SECRET"]
+
+HTTPX_TIMEOUT = 30.0
+STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
 
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
@@ -56,9 +60,10 @@ GCAL = "https://www.googleapis.com/calendar/v3"
 # ── In-memory stores ───────────────────────────────────────────────────────────
 # Fine for single-process personal use; restart clears sessions (re-auth needed).
 
-_state_store: dict[str, dict] = {}   # our_state  → OAuth flow params
+_state_store: dict[str, dict] = {}   # our_state  → {..., "created": ts}
 _code_store: dict[str, dict] = {}    # our_code   → {jti, email, code_challenge, ...}
-_token_store: dict[str, dict] = {}   # jti        → {access_token, refresh_token, expiry, email}
+_token_store: dict[str, dict] = {}   # jti        → {access_token, refresh_token, expiry, email, jwt_exp}
+_refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent token refreshes
 
 # ── Per-request context ────────────────────────────────────────────────────────
 
@@ -67,30 +72,61 @@ _user_email: ContextVar[str] = ContextVar("user_email", default="")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+class ReauthRequired(Exception):
+    """Raised when a session is unknown or Google has revoked/expired the refresh token."""
+
+
 def _pkce_ok(verifier: str, challenge: str) -> bool:
     digest = hashlib.sha256(verifier.encode()).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == challenge
 
 
+def _purge_expired_states() -> None:
+    now = time.time()
+    expired = [k for k, v in _state_store.items() if now - v.get("created", now) > STATE_TTL]
+    for k in expired:
+        _state_store.pop(k, None)
+
+
+def _purge_expired_tokens() -> None:
+    now = time.time()
+    expired = [jti for jti, d in _token_store.items() if now >= d.get("jwt_exp", float("inf"))]
+    for jti in expired:
+        _token_store.pop(jti, None)
+        _refresh_locks.pop(jti, None)
+
+
 async def _refresh(jti: str) -> str:
-    d = _token_store[jti]
-    async with httpx.AsyncClient() as c:
-        r = await c.post("https://oauth2.googleapis.com/token", data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": d["refresh_token"],
-            "grant_type": "refresh_token",
-        })
-        t = r.json()
-    d["access_token"] = t["access_token"]
-    d["expiry"] = time.time() + t.get("expires_in", 3600)
-    return d["access_token"]
+    # Lock per session so two concurrent requests hitting an expired token don't
+    # both fire a refresh_token grant (Google can reject the second as reused).
+    lock = _refresh_locks.setdefault(jti, asyncio.Lock())
+    async with lock:
+        d = _token_store.get(jti)
+        if not d:
+            raise ReauthRequired("session not found")
+        if time.time() < d["expiry"] - 60:
+            # Another coroutine already refreshed while we waited on the lock.
+            return d["access_token"]
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
+            r = await c.post("https://oauth2.googleapis.com/token", data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": d["refresh_token"],
+                "grant_type": "refresh_token",
+            })
+            t = r.json()
+        if "access_token" not in t:
+            _token_store.pop(jti, None)
+            raise ReauthRequired(t.get("error_description", t.get("error", "refresh failed")))
+        d["access_token"] = t["access_token"]
+        d["expiry"] = time.time() + t.get("expires_in", 3600)
+        return d["access_token"]
 
 
 async def _google_access_token(jti: str) -> str:
     d = _token_store.get(jti)
     if not d:
-        raise ValueError("session not found")
+        raise ReauthRequired("session not found")
     if time.time() >= d["expiry"] - 60:
         return await _refresh(jti)
     return d["access_token"]
@@ -103,12 +139,17 @@ def _auth() -> dict:
     return {"Authorization": f"Bearer {t}"}
 
 
-def _build_email(to: str, subject: str, body: str, cc: str = "") -> str:
+def _build_email(to: str, subject: str, body: str, cc: str = "",
+                 in_reply_to: str = "", references: str = "") -> str:
     msg = MIMEText(body)
     msg["to"] = to
     msg["subject"] = subject
     if cc:
         msg["cc"] = cc
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
     return base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
 
@@ -120,7 +161,7 @@ mcp = FastMCP("Gmail MCP")
 @mcp.tool
 async def get_profile() -> dict:
     """Get the authenticated Gmail account's profile."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/profile", headers=_auth())
         r.raise_for_status()
         return r.json()
@@ -129,7 +170,7 @@ async def get_profile() -> dict:
 @mcp.tool
 async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     """Search Gmail. Supports all Gmail search operators (from:, subject:, has:attachment, etc.)."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/messages", headers=_auth(),
                         params={"q": query, "maxResults": max_results})
         r.raise_for_status()
@@ -139,28 +180,26 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 @mcp.tool
 async def read_message(message_id: str) -> dict:
     """Read a Gmail message by ID. Returns headers and decoded body."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/messages/{message_id}", headers=_auth(),
                         params={"format": "full"})
         r.raise_for_status()
         data = r.json()
 
-    def _body(part: dict) -> str:
-        raw = part.get("body", {}).get("data", "")
-        return base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace") if raw else ""
+    def _extract_body(part: dict, mime: str) -> str:
+        # Recurses into nested parts (e.g. multipart/mixed > multipart/alternative > text/plain).
+        if part.get("mimeType") == mime:
+            raw = part.get("body", {}).get("data", "")
+            if raw:
+                return base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace")
+        for sub in part.get("parts", []):
+            found = _extract_body(sub, mime)
+            if found:
+                return found
+        return ""
 
     payload = data.get("payload", {})
-    body = _body(payload)
-    if not body:
-        for part in payload.get("parts", []):
-            if part.get("mimeType") == "text/plain":
-                body = _body(part)
-                break
-        if not body:
-            for part in payload.get("parts", []):
-                if part.get("mimeType") == "text/html":
-                    body = _body(part)
-                    break
+    body = _extract_body(payload, "text/plain") or _extract_body(payload, "text/html")
 
     hdrs = {h["name"]: h["value"] for h in payload.get("headers", [])}
     return {
@@ -179,7 +218,7 @@ async def read_message(message_id: str) -> dict:
 @mcp.tool
 async def read_thread(thread_id: str) -> dict:
     """Read a full Gmail thread."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=_auth())
         r.raise_for_status()
         return r.json()
@@ -189,14 +228,25 @@ async def read_thread(thread_id: str) -> dict:
 async def send_email(to: str, subject: str, body: str, cc: str = "",
                      reply_to_message_id: str = "") -> dict:
     """Send an email. Use reply_to_message_id to reply within a thread."""
-    payload: dict = {"raw": _build_email(to, subject, body, cc)}
+    thread_id = ""
+    in_reply_to = ""
+    references = ""
     if reply_to_message_id:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}",
-                            headers=_auth(), params={"format": "minimal"})
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
+            r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=_auth(),
+                            params={"format": "metadata",
+                                    "metadataHeaders": ["Message-ID", "References"]})
             if r.is_success:
-                payload["threadId"] = r.json().get("threadId", "")
-    async with httpx.AsyncClient() as c:
+                msg = r.json()
+                thread_id = msg.get("threadId", "")
+                hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+                in_reply_to = hdrs.get("Message-ID", "")
+                references = (hdrs.get("References", "") + " " + in_reply_to).strip()
+
+    payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
+    if thread_id:
+        payload["threadId"] = thread_id
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/messages/send", headers=_auth(), json=payload)
         r.raise_for_status()
         return r.json()
@@ -205,7 +255,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
 @mcp.tool
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
                          json={"message": {"raw": _build_email(to, subject, body, cc)}})
         r.raise_for_status()
@@ -215,7 +265,7 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List Gmail drafts."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/drafts", headers=_auth(),
                         params={"maxResults": max_results})
         r.raise_for_status()
@@ -225,19 +275,19 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 @mcp.tool
 async def list_labels() -> list[dict]:
     """List all Gmail labels."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/labels", headers=_auth())
         r.raise_for_status()
         return r.json().get("labels", [])
 
 
 @mcp.tool
-async def modify_labels(message_id: str, add: list[str] = [],
-                        remove: list[str] = []) -> dict:
+async def modify_labels(message_id: str, add: list[str] | None = None,
+                        remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
-                         json={"addLabelIds": add, "removeLabelIds": remove})
+                         json={"addLabelIds": add or [], "removeLabelIds": remove or []})
         r.raise_for_status()
         return r.json()
 
@@ -245,7 +295,7 @@ async def modify_labels(message_id: str, add: list[str] = [],
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
         r.raise_for_status()
         return r.json()
@@ -254,7 +304,7 @@ async def trash_message(message_id: str) -> dict:
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all Google Calendars."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GCAL}/users/me/calendarList", headers=_auth())
         r.raise_for_status()
         return r.json().get("items", [])
@@ -269,7 +319,7 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
         params["timeMin"] = time_min
     if time_max:
         params["timeMax"] = time_max
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GCAL}/calendars/{calendar_id}/events",
                         headers=_auth(), params=params)
         r.raise_for_status()
@@ -280,7 +330,7 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
 async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 10) -> list[dict]:
     """Search calendar events by keyword."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GCAL}/calendars/{calendar_id}/events", headers=_auth(),
                         params={"q": query, "maxResults": max_results, "singleEvents": True})
         r.raise_for_status()
@@ -290,7 +340,7 @@ async def search_events(query: str, calendar_id: str = "primary",
 @mcp.tool
 async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
     """Get a specific calendar event by ID."""
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GCAL}/calendars/{calendar_id}/events/{event_id}",
                         headers=_auth())
         r.raise_for_status()
@@ -343,6 +393,7 @@ async def _authorize(req: Request):
         "client_state": p.get("state"),
         "client_redirect_uri": redirect_uri,
         "code_challenge": p.get("code_challenge"),
+        "created": time.time(),
     }
     return RedirectResponse(
         "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
@@ -366,7 +417,7 @@ async def _auth_callback(req: Request):
     if not state_data:
         return Response("Invalid or expired state", status_code=400)
 
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post("https://oauth2.googleapis.com/token", data={
             "code": req.query_params.get("code"),
             "client_id": GOOGLE_CLIENT_ID,
@@ -379,7 +430,7 @@ async def _auth_callback(req: Request):
     if "error" in tokens:
         return Response(f"Token exchange failed: {tokens['error']}", status_code=400)
 
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         ui = await c.get("https://www.googleapis.com/oauth2/v3/userinfo",
                          headers={"Authorization": f"Bearer {tokens['access_token']}"})
         userinfo = ui.json()
@@ -390,6 +441,9 @@ async def _auth_callback(req: Request):
         "refresh_token": tokens.get("refresh_token"),
         "expiry": time.time() + tokens.get("expires_in", 3600),
         "email": userinfo.get("email"),
+        # Provisional; replaced with the real 30-day expiry once /token mints the client JWT.
+        # Ensures flows abandoned between here and /token still get purged.
+        "jwt_exp": time.time() + STATE_TTL,
     }
 
     our_code = secrets.token_urlsafe(16)
@@ -418,12 +472,16 @@ async def _token(req: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     now = int(time.time())
+    exp = now + 86400 * 30
     token = jwt.encode({
         "jti": code_data["jti"],
         "email": code_data["email"],
         "iat": now,
-        "exp": now + 86400 * 30,
+        "exp": exp,
     }, JWT_SECRET, algorithm="HS256")
+
+    if code_data["jti"] in _token_store:
+        _token_store[code_data["jti"]]["jwt_exp"] = exp
 
     return JSONResponse({"access_token": token, "token_type": "Bearer",
                          "expires_in": 86400 * 30})
@@ -444,6 +502,21 @@ _OAUTH_PATHS = frozenset([
     "/auth/callback",
     "/token",
 ])
+
+_KNOWN_PATHS = _OAUTH_PATHS | {"/mcp"}
+
+
+def _normalise_path(path: str) -> str:
+    """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
+    resolve the same as their unaliased routes — lets two Claude connectors share one server."""
+    if path in _KNOWN_PATHS or path.startswith("/mcp/"):
+        return path
+    segments = path.lstrip("/").split("/", 1)
+    if len(segments) == 2:
+        candidate = "/" + segments[1]
+        if candidate in _KNOWN_PATHS or candidate.startswith("/mcp/"):
+            return candidate
+    return path
 
 
 class _App:
@@ -466,13 +539,12 @@ class _App:
             return
 
         if scope["type"] == "http":
-            path = scope["path"]
+            _purge_expired_states()
+            _purge_expired_tokens()
 
-            # Normalize /<alias>/mcp → /mcp so two Claude connectors can share one server
-            parts = path.split("/")  # "/edgar/mcp" → ["", "edgar", "mcp"]
-            if len(parts) == 3 and parts[2] == "mcp":
-                scope = {**scope, "path": "/mcp", "raw_path": b"/mcp"}
-                path = "/mcp"
+            path = _normalise_path(scope["path"])
+            if path != scope["path"]:
+                scope = {**scope, "path": path, "raw_path": path.encode()}
 
             # Auth check for MCP endpoint only
             if path == "/mcp" or path.startswith("/mcp/"):
