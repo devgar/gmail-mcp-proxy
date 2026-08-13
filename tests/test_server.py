@@ -246,3 +246,94 @@ async def test_report_phishing_moves_message_to_spam():
     assert json.loads(route.calls.last.request.content) == {
         "addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"],
     }
+
+
+@respx.mock
+async def test_search_emails_enriches_results_with_headers():
+    respx.get(f"{server.GMAIL}/messages").mock(return_value=httpx.Response(200, json={
+        "messages": [{"id": "1", "threadId": "t1"}],
+    }))
+    respx.get(f"{server.GMAIL}/messages/1").mock(return_value=httpx.Response(200, json={
+        "snippet": "hello there", "labelIds": ["INBOX"],
+        "payload": {"headers": [
+            {"name": "From", "value": "a@example.com"},
+            {"name": "Subject", "value": "Lunch"},
+        ]},
+    }))
+
+    results = await server.search_emails("test query")
+
+    assert results[0]["from"] == "a@example.com"
+    assert results[0]["subject"] == "Lunch"
+    assert results[0]["snippet"] == "hello there"
+    assert results[0]["labels"] == ["INBOX"]
+
+
+@respx.mock
+async def test_search_emails_degrades_gracefully_on_network_error():
+    # Regression test: a network-level exception enriching one message used to fail the
+    # whole search instead of falling back to bare id/threadId for that one message.
+    respx.get(f"{server.GMAIL}/messages").mock(return_value=httpx.Response(200, json={
+        "messages": [{"id": "1", "threadId": "t1"}, {"id": "2", "threadId": "t2"}],
+    }))
+    respx.get(f"{server.GMAIL}/messages/1").mock(return_value=httpx.Response(200, json={
+        "snippet": "hi", "labelIds": [],
+        "payload": {"headers": [{"name": "From", "value": "a@example.com"}]},
+    }))
+    respx.get(f"{server.GMAIL}/messages/2").mock(side_effect=httpx.ConnectTimeout("boom"))
+
+    results = await server.search_emails("test query")
+
+    assert len(results) == 2
+    assert next(r for r in results if r["id"] == "1")["from"] == "a@example.com"
+    assert "from" not in next(r for r in results if r["id"] == "2")
+
+
+@respx.mock
+async def test_search_emails_degrades_on_http_error_status():
+    respx.get(f"{server.GMAIL}/messages").mock(return_value=httpx.Response(200, json={
+        "messages": [{"id": "1", "threadId": "t1"}]}))
+    respx.get(f"{server.GMAIL}/messages/1").mock(return_value=httpx.Response(500))
+
+    assert await server.search_emails("q") == [{"id": "1", "threadId": "t1"}]
+
+
+@respx.mock
+async def test_search_emails_enrich_limit_zero_skips_enrichment():
+    respx.get(f"{server.GMAIL}/messages").mock(return_value=httpx.Response(200, json={
+        "messages": [{"id": "1", "threadId": "t1"}]}))
+    detail = respx.get(f"{server.GMAIL}/messages/1")
+
+    results = await server.search_emails("q", enrich_limit=0)
+
+    assert results == [{"id": "1", "threadId": "t1"}]
+    assert not detail.called, "enrich_limit=0 must not fetch any message metadata"
+
+
+@respx.mock
+async def test_search_emails_enriches_only_up_to_limit():
+    msgs = [{"id": str(i), "threadId": f"t{i}"} for i in range(5)]
+    respx.get(f"{server.GMAIL}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": msgs}))
+    for i in range(5):
+        respx.get(f"{server.GMAIL}/messages/{i}").mock(return_value=httpx.Response(
+            200, json={"snippet": "s", "labelIds": [], "payload": {"headers": []}}))
+
+    results = await server.search_emails("q", enrich_limit=2)
+
+    assert [("snippet" in r) for r in results] == [True, True, False, False, False]
+
+
+@respx.mock
+async def test_search_emails_clamps_enrich_limit_to_ceiling():
+    # A caller asking for 500 must not fan out into 500 concurrent Gmail calls.
+    msgs = [{"id": str(i), "threadId": f"t{i}"} for i in range(server.SEARCH_ENRICH_MAX + 10)]
+    respx.get(f"{server.GMAIL}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": msgs}))
+    detail = respx.get(url__regex=rf"{server.GMAIL}/messages/\d+").mock(
+        return_value=httpx.Response(200, json={"snippet": "s", "labelIds": [],
+                                               "payload": {"headers": []}}))
+
+    await server.search_emails("q", enrich_limit=500)
+
+    assert detail.call_count == server.SEARCH_ENRICH_MAX
