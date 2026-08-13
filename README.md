@@ -160,6 +160,18 @@ Click **Connect** and authenticate with your Google account.
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests mock all Gmail/Calendar API calls (via `respx`) and cover the pure-logic helpers
+(PKCE, alias path normalisation, MIME building) plus the behaviour that's easy to get
+wrong — deeply nested MIME bodies, reply threading, token-refresh races and revoked
+refresh tokens, and expiry-based store cleanup. No live Google credentials needed.
+
 ## Notes
 
 - Sessions are stored in memory — a server restart requires re-authentication in Claude.ai

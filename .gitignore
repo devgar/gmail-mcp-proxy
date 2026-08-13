@@ -2,3 +2,6 @@
 credentials/
 .claude/
 con.yml
+__pycache__/
+.pytest_cache/
+.venv*/
