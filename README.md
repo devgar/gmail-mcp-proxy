@@ -158,6 +158,7 @@ Click **Connect** and authenticate with your Google account.
 | `JWT_SECRET` | Secret for signing session JWTs (any random string) |
 | `BASE_URL` | Public base URL, e.g. `https://example.com/gmail` (no trailing slash) |
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
+| `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 
 ## Notes
 
