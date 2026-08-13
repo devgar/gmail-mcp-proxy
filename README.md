@@ -164,8 +164,13 @@ Click **Connect** and authenticate with your Google account.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+pytest          # test suite
+ruff check .    # lint
+mypy            # type check (config in pyproject.toml)
 ```
+
+All three run in CI on every push and pull request, against Python 3.12 (the version the
+Docker image uses), 3.13 and 3.14.
 
 Tests mock all Gmail/Calendar API calls (via `respx`) and cover the pure-logic helpers
 (PKCE, alias path normalisation, MIME building) plus the behaviour that's easy to get
