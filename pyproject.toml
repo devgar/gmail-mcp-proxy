@@ -1,0 +1,44 @@
+# Tool configuration only for now. Packaging metadata ([project], dependency groups
+# and a lockfile) arrives with the uv migration — see the roadmap issue.
+
+[tool.ruff]
+target-version = "py312"
+# The codebase hand-wraps at just over the default 88; 105 is the longest existing line.
+line-length = 110
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "B",    # bugbear — likely bugs
+    "UP",   # pyupgrade
+    "RUF",  # ruff-specific
+    "PLW",  # pylint warnings
+    "PLE",  # pylint errors
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The shared HTTP client is module-level state deliberately assigned once by the ASGI
+# lifespan; `global` is the mechanism, not an accident. Restructuring it into a holder
+# object to satisfy the linter would add indirection for no benefit.
+"server.py" = ["PLW0603"]
+# Tests reach into module internals and mutate module-level state to set up the
+# conditions under test.
+"tests/*" = ["PLW0603"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["server.py"]
+# Not strict yet: the codebase has no annotations on many internals, and turning
+# everything on at once would mean a large annotation pass rather than a CI change.
+# It already catches real bugs at this level — see the /token form-data fix.
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# fastmcp ships types but its decorators are dynamic enough to need this.
+module = ["fastmcp.*"]
+ignore_missing_imports = true
