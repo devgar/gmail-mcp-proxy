@@ -8,6 +8,8 @@ Flow:
 import asyncio
 import base64
 import hashlib
+import hmac
+import logging
 import os
 import secrets
 import time
@@ -22,6 +24,12 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("gmail_mcp")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -78,7 +86,8 @@ class ReauthRequired(Exception):
 
 def _pkce_ok(verifier: str, challenge: str) -> bool:
     digest = hashlib.sha256(verifier.encode()).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == challenge
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return hmac.compare_digest(computed, challenge)
 
 
 def _purge_expired_states() -> None:
@@ -120,7 +129,10 @@ async def _refresh(jti: str) -> str:
             t = r.json()
         if "access_token" not in t:
             _token_store.pop(jti, None)
-            raise ReauthRequired(t.get("error_description", t.get("error", "refresh failed")))
+            _refresh_locks.pop(jti, None)
+            reason = t.get("error_description", t.get("error", "refresh failed"))
+            log.warning("token refresh failed, session needs re-auth: %s", reason)
+            raise ReauthRequired(reason)
         d["access_token"] = t["access_token"]
         d["expiry"] = time.time() + t.get("expires_in", 3600)
         return d["access_token"]
@@ -433,13 +445,18 @@ async def _auth_callback(req: Request):
         tokens = r.json()
 
     if "error" in tokens:
+        log.warning("Google token exchange failed: %s", tokens["error"])
         return Response(f"Token exchange failed: {tokens['error']}", status_code=400)
 
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         ui = await c.get("https://www.googleapis.com/oauth2/v3/userinfo",
                          headers={"Authorization": f"Bearer {tokens['access_token']}"})
+        if not ui.is_success:
+            log.warning("Google userinfo fetch failed (%s): %s", ui.status_code, ui.text[:200])
+            return Response("Failed to fetch Google account info", status_code=502)
         userinfo = ui.json()
 
+    log.info("new session authenticated: %s", userinfo.get("email"))
     jti = secrets.token_urlsafe(16)
     _token_store[jti] = {
         "access_token": tokens["access_token"],
@@ -511,6 +528,25 @@ _OAUTH_PATHS = frozenset([
 
 _KNOWN_PATHS = _OAUTH_PATHS | {"/mcp"}
 
+_SECURITY_HEADERS = [
+    (b"strict-transport-security", b"max-age=63072000; includeSubDomains"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+]
+
+
+def _with_security_headers(send):
+    """Wraps an ASGI send() so every response — including ones from the mounted
+    OAuth/FastMCP sub-apps — gets standard security headers. /authorize is the one
+    point a real browser touches (the user's, round-tripping through Google's
+    consent screen), so this is worth doing even though most traffic is API calls."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            headers = list(message.get("headers", [])) + _SECURITY_HEADERS
+            message = {**message, "headers": headers}
+        await send(message)
+    return wrapped
+
 
 def _normalise_path(path: str) -> str:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
@@ -545,8 +581,13 @@ class _App:
             return
 
         if scope["type"] == "http":
-            _purge_expired_states()
-            _purge_expired_tokens()
+            send = _with_security_headers(send)
+
+            try:
+                _purge_expired_states()
+                _purge_expired_tokens()
+            except Exception:
+                log.exception("periodic cleanup failed")
 
             path = _normalise_path(scope["path"])
             if path != scope["path"]:
@@ -562,11 +603,20 @@ class _App:
                 try:
                     payload = jwt.decode(auth[7:], JWT_SECRET, algorithms=["HS256"])
                     google_tok = await _google_access_token(payload["jti"])
-                    _google_token.set(google_tok)
-                    _user_email.set(payload.get("email", ""))
-                except Exception:
+                except jwt.PyJWTError as e:
+                    log.info("rejected MCP request: invalid/expired JWT (%s)", e)
                     await self._send_401(send)
                     return
+                except ReauthRequired as e:
+                    log.warning("MCP request needs re-auth: %s", e)
+                    await self._send_401(send)
+                    return
+                except Exception:
+                    log.exception("unexpected error validating MCP request")
+                    await self._send_401(send)
+                    return
+                _google_token.set(google_tok)
+                _user_email.set(payload.get("email", ""))
 
             if path in _OAUTH_PATHS:
                 await self._oauth(scope, receive, send)
