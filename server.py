@@ -61,7 +61,7 @@ GCAL = "https://www.googleapis.com/calendar/v3"
 # Fine for single-process personal use; restart clears sessions (re-auth needed).
 
 _state_store: dict[str, dict] = {}   # our_state  → {..., "created": ts}
-_code_store: dict[str, dict] = {}    # our_code   → {jti, email, code_challenge, ...}
+_code_store: dict[str, dict] = {}    # our_code   → {jti, email, code_challenge, ..., "created": ts}
 _token_store: dict[str, dict] = {}   # jti        → {access_token, refresh_token, expiry, email, jwt_exp}
 _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent token refreshes
 
@@ -86,6 +86,9 @@ def _purge_expired_states() -> None:
     expired = [k for k, v in _state_store.items() if now - v.get("created", now) > STATE_TTL]
     for k in expired:
         _state_store.pop(k, None)
+    expired = [k for k, v in _code_store.items() if now - v.get("created", now) > STATE_TTL]
+    for k in expired:
+        _code_store.pop(k, None)
 
 
 def _purge_expired_tokens() -> None:
@@ -236,12 +239,14 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
             r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=_auth(),
                             params={"format": "metadata",
                                     "metadataHeaders": ["Message-ID", "References"]})
-            if r.is_success:
-                msg = r.json()
-                thread_id = msg.get("threadId", "")
-                hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                in_reply_to = hdrs.get("Message-ID", "")
-                references = (hdrs.get("References", "") + " " + in_reply_to).strip()
+            # Fail loudly rather than silently sending an unthreaded standalone email
+            # when the caller explicitly asked for a reply.
+            r.raise_for_status()
+            msg = r.json()
+            thread_id = msg.get("threadId", "")
+            hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            in_reply_to = hdrs.get("Message-ID", "")
+            references = (hdrs.get("References", "") + " " + in_reply_to).strip()
 
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
@@ -453,6 +458,7 @@ async def _auth_callback(req: Request):
         "code_challenge": state_data["code_challenge"],
         "client_redirect_uri": state_data["client_redirect_uri"],
         "client_state": state_data["client_state"],
+        "created": time.time(),
     }
 
     params: dict = {"code": our_code}

@@ -53,8 +53,8 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 ### 2. Deploy
 
 ```bash
-git clone https://github.com/yourusername/gmail-mcp
-cd gmail-mcp
+git clone https://github.com/devgar/gmail-mcp-proxy
+cd gmail-mcp-proxy
 
 cp .env.example .env
 # Fill in GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
@@ -119,6 +119,22 @@ location /gmail/ {
 
 Note: `BASE_URL` must match the public path the proxy serves (e.g. `https://your-domain.com/gmail`), since the server builds its OAuth redirect URIs from it.
 
+#### Deploying to Railway / Render
+
+On a PaaS platform (Railway, Render, etc.) there's no path prefix or reverse proxy to
+configure — the platform gives the container its own domain and terminates HTTPS itself:
+
+1. Create a new service from this repo (the `Dockerfile` is detected automatically).
+2. Generate a public domain for the service, e.g. `your-app.up.railway.app`.
+3. Set `BASE_URL` to that bare domain — `https://your-app.up.railway.app`, no path suffix.
+4. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `JWT_SECRET` as usual (see
+   Configuration below).
+5. Use `https://your-app.up.railway.app/auth/callback` as the Authorized redirect URI
+   in the Google Cloud OAuth client.
+
+The server reads the platform-injected `PORT` env var automatically, so no port
+configuration is needed.
+
 ### 3. Connect to Claude.ai
 
 In Claude.ai → Settings → Integrations → Add MCP server:
@@ -141,6 +157,7 @@ Click **Connect** and authenticate with your Google account.
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
 | `JWT_SECRET` | Secret for signing session JWTs (any random string) |
 | `BASE_URL` | Public base URL, e.g. `https://example.com/gmail` (no trailing slash) |
+| `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 
 ## Notes
 
