@@ -378,28 +378,23 @@ async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
 
 # ── OAuth endpoints ────────────────────────────────────────────────────────────
 
-async def _oauth_server_metadata(req: Request) -> JSONResponse:
-    return JSONResponse({
+def _base_oauth_metadata() -> dict:
+    return {
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/authorize",
         "token_endpoint": f"{BASE_URL}/token",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["gmail"],
-    })
+    }
+
+
+async def _oauth_server_metadata(req: Request) -> JSONResponse:
+    return JSONResponse({**_base_oauth_metadata(), "scopes_supported": ["gmail"]})
 
 
 async def _openid_configuration(req: Request) -> JSONResponse:
-    return JSONResponse({
-        "issuer": BASE_URL,
-        "authorization_endpoint": f"{BASE_URL}/authorize",
-        "token_endpoint": f"{BASE_URL}/token",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "gmail"],
-    })
+    return JSONResponse({**_base_oauth_metadata(), "scopes_supported": ["openid", "gmail"]})
 
 
 async def _protected_resource(req: Request) -> JSONResponse:
