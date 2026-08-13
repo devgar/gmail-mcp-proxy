@@ -184,3 +184,65 @@ def test_purge_expired_states_drops_stale_entries_only():
     assert set(server._code_store) == {"fresh"}
     server._state_store.clear()
     server._code_store.clear()
+
+
+@respx.mock
+async def test_delete_draft_handles_204_no_content():
+    # drafts.delete answers 204 with an empty body, so calling .json() the way the
+    # other write tools do would raise instead of reporting success.
+    respx.delete(f"{server.GMAIL}/drafts/abc").mock(return_value=httpx.Response(204))
+
+    assert await server.delete_draft("abc") == {"deleted": "abc"}
+
+
+@respx.mock
+async def test_delete_label_handles_204_no_content():
+    respx.delete(f"{server.GMAIL}/labels/Label_1").mock(return_value=httpx.Response(204))
+
+    assert await server.delete_label("Label_1") == {"deleted": "Label_1"}
+
+
+@respx.mock
+async def test_delete_draft_still_raises_on_real_error():
+    respx.delete(f"{server.GMAIL}/drafts/abc").mock(return_value=httpx.Response(404))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await server.delete_draft("abc")
+
+
+@respx.mock
+async def test_update_label_sends_only_provided_fields():
+    # PATCH semantics: omitting a field must leave it untouched rather than blanking it.
+    route = respx.patch(f"{server.GMAIL}/labels/Label_1").mock(
+        return_value=httpx.Response(200, json={"id": "Label_1", "name": "Renamed"})
+    )
+
+    await server.update_label("Label_1", name="Renamed")
+
+    assert json.loads(route.calls.last.request.content) == {"name": "Renamed"}
+
+
+@respx.mock
+async def test_update_draft_replaces_content():
+    route = respx.put(f"{server.GMAIL}/drafts/d1").mock(
+        return_value=httpx.Response(200, json={"id": "d1"})
+    )
+
+    await server.update_draft("d1", "a@example.com", "New subject", "new body")
+
+    raw = json.loads(route.calls.last.request.content)["message"]["raw"]
+    decoded = base64.urlsafe_b64decode(raw + "==").decode()
+    assert "New subject" in decoded and "new body" in decoded
+
+
+@respx.mock
+async def test_report_phishing_moves_message_to_spam():
+    route = respx.post(f"{server.GMAIL}/messages/m1/modify").mock(
+        return_value=httpx.Response(200, json={"id": "m1"})
+    )
+
+    await server.report_phishing("m1")
+
+    assert json.loads(route.calls.last.request.content) == {
+        "addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"],
+    }
