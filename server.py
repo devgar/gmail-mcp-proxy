@@ -302,12 +302,90 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 
 
 @mcp.tool
+async def send_draft(draft_id: str) -> dict:
+    """Send an existing Gmail draft."""
+    c = _client()
+    r = await c.post(f"{GMAIL}/drafts/send", headers=_auth(),
+                     json={"id": draft_id})
+    r.raise_for_status()
+    return r.json()
+
+
+
+@mcp.tool
+async def update_draft(draft_id: str, to: str, subject: str, body: str,
+                       cc: str = "") -> dict:
+    """Replace the content of an existing Gmail draft."""
+    c = _client()
+    r = await c.put(f"{GMAIL}/drafts/{draft_id}", headers=_auth(),
+                    json={"message": {"raw": _build_email(to, subject, body, cc)}})
+    r.raise_for_status()
+    return r.json()
+
+
+
+@mcp.tool
+async def delete_draft(draft_id: str) -> dict:
+    """Permanently delete a Gmail draft."""
+    c = _client()
+    r = await c.delete(f"{GMAIL}/drafts/{draft_id}", headers=_auth())
+    if r.status_code != 204:
+        r.raise_for_status()
+    return {"deleted": draft_id}
+
+
+
+@mcp.tool
 async def list_labels() -> list[dict]:
     """List all Gmail labels."""
     c = _client()
     r = await c.get(f"{GMAIL}/labels", headers=_auth())
     r.raise_for_status()
     return r.json().get("labels", [])
+
+
+@mcp.tool
+async def create_label(name: str, label_list_visibility: str = "labelShow",
+                       message_list_visibility: str = "show") -> dict:
+    """Create a new Gmail label."""
+    c = _client()
+    r = await c.post(f"{GMAIL}/labels", headers=_auth(),
+                     json={"name": name,
+                           "labelListVisibility": label_list_visibility,
+                           "messageListVisibility": message_list_visibility})
+    r.raise_for_status()
+    return r.json()
+
+
+
+@mcp.tool
+async def update_label(label_id: str, name: str | None = None,
+                       label_list_visibility: str | None = None,
+                       message_list_visibility: str | None = None) -> dict:
+    """Rename or change visibility of an existing Gmail label."""
+    body = {}
+    if name is not None:
+        body["name"] = name
+    if label_list_visibility is not None:
+        body["labelListVisibility"] = label_list_visibility
+    if message_list_visibility is not None:
+        body["messageListVisibility"] = message_list_visibility
+    c = _client()
+    r = await c.patch(f"{GMAIL}/labels/{label_id}", headers=_auth(), json=body)
+    r.raise_for_status()
+    return r.json()
+
+
+
+@mcp.tool
+async def delete_label(label_id: str) -> dict:
+    """Permanently delete a Gmail label."""
+    c = _client()
+    r = await c.delete(f"{GMAIL}/labels/{label_id}", headers=_auth())
+    if r.status_code != 204:
+        r.raise_for_status()
+    return {"deleted": label_id}
+
 
 
 @mcp.tool
@@ -319,6 +397,17 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
                      json={"addLabelIds": add or [], "removeLabelIds": remove or []})
     r.raise_for_status()
     return r.json()
+
+
+@mcp.tool
+async def report_phishing(message_id: str) -> dict:
+    """Mark a Gmail message as spam."""
+    c = _client()
+    r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
+                     json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
+    r.raise_for_status()
+    return r.json()
+
 
 
 @mcp.tool

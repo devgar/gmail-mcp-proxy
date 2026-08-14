@@ -24,8 +24,15 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 | `send_email` | Send or reply to a thread |
 | `create_draft` | Save a draft |
 | `list_drafts` | List drafts |
+| `send_draft` | Send an existing draft |
+| `update_draft` | Replace the content of an existing draft |
+| `delete_draft` | Permanently delete a draft |
 | `list_labels` | All Gmail labels |
+| `create_label` | Create a new label |
+| `update_label` | Rename or change visibility of a label |
+| `delete_label` | Permanently delete a label |
 | `modify_labels` | Add/remove labels on a message |
+| `report_phishing` | Mark a message as spam |
 | `trash_message` | Move to trash |
 | `list_calendars` | All calendars |
 | `list_events` | Events with optional time range filter |
