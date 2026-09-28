@@ -6,6 +6,8 @@ on:
   # No branch filter: PRs in a stack target the layer below them rather than main,
   # so filtering on main would skip every PR except the bottom one.
   pull_request:
+  # Lets release.yml gate publishing on the same checks.
+  workflow_call:
 
 # A new push supersedes the previous run for the same ref.
 concurrency:

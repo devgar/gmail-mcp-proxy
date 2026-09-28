@@ -77,10 +77,17 @@ pip install -r requirements.txt
 set -a && . ./.env && set +a   # load the variables from .env
 python server.py
 
-# Or with the included Dockerfile
+# Or with the prebuilt image (published for every release)
+docker run -d --env-file .env -p 8000:8000 ghcr.io/devgar/gmail-mcp-proxy:latest
+
+# Or build it yourself from the included Dockerfile
 docker build -t gmail-mcp .
 docker run -d --env-file .env -p 8000:8000 gmail-mcp
 ```
+
+Image tags: `latest`, the exact version (`0.1.0`) and the minor line (`0.1`). Pin one of
+the latter two in production — every restart forces all connectors to re-authorise, so
+you'll want to choose when updates happen.
 
 Put it behind any reverse proxy that terminates HTTPS (Caddy, nginx, Traefik, …) and forwards `https://<your-domain>/gmail` to port `8000`.
 
@@ -92,7 +99,7 @@ A minimal `compose.yml` to run the container — uncomment the labels for whiche
 services:
   gmail-mcp:
     build: .
-    # image: gmail-mcp           # or a prebuilt image instead of build
+    # image: ghcr.io/devgar/gmail-mcp-proxy:0.1   # or a prebuilt image instead of build
     env_file: .env
     restart: unless-stopped
     # expose the port only if your proxy reaches it directly (not via a shared network)
@@ -184,6 +191,18 @@ Tests mock all Gmail/Calendar API calls (via `respx`) and cover the pure-logic h
 (PKCE, alias path normalisation, MIME building) plus the behaviour that's easy to get
 wrong — deeply nested MIME bodies, reply threading, token-refresh races and revoked
 refresh tokens, and expiry-based store cleanup. No live Google credentials needed.
+
+### Releasing
+
+Tag a commit on `main` and push the tag:
+
+```bash
+git tag -a v0.1.0 -m v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` re-runs CI on the tagged commit, pushes the image to
+`ghcr.io/devgar/gmail-mcp-proxy` and creates a GitHub Release with generated notes.
 
 ## Read-only accounts
 
