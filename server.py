@@ -15,7 +15,7 @@ import secrets
 import time
 from contextvars import ContextVar
 from email.mime.text import MIMEText
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt
@@ -60,16 +60,31 @@ ALLOWED_REDIRECT_URIS = frozenset(
     ).split(",") if u.strip()
 )
 
-GOOGLE_SCOPES = " ".join([
+# Connector aliases (e.g. /work/mcp) listed here are restricted to read-only. See the
+# "Read-only accounts" section of the README for how the restriction is enforced.
+READ_ONLY_ALIASES = frozenset(
+    a.strip().strip("/") for a in os.environ.get("READ_ONLY_ALIASES", "").split(",")
+    if a.strip()
+)
+
+GOOGLE_SCOPES_READ = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
+GOOGLE_SCOPES_WRITE = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar.readonly",
-])
+]
+
+
+def _google_scopes(read_only: bool) -> str:
+    return " ".join(GOOGLE_SCOPES_READ if read_only
+                    else GOOGLE_SCOPES_READ + GOOGLE_SCOPES_WRITE)
+
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
@@ -98,6 +113,7 @@ _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent
 
 _google_token: ContextVar[str] = ContextVar("google_token", default="")
 _user_email: ContextVar[str] = ContextVar("user_email", default="")
+_read_only: ContextVar[bool] = ContextVar("read_only", default=False)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -173,6 +189,24 @@ def _auth() -> dict:
     if not t:
         raise RuntimeError("not authenticated")
     return {"Authorization": f"Bearer {t}"}
+
+
+def _require_write() -> None:
+    if _read_only.get():
+        raise PermissionError(
+            "this connection is authorized read-only; write actions are disabled")
+
+
+def _alias_from_resource(resource: str | None) -> str:
+    """Extract the alias from an OAuth 'resource' parameter (RFC 8707), e.g.
+    https://host/work/mcp -> "work". Only a fallback for when /authorize was reached
+    at its unaliased path; returns "" if absent or unparseable."""
+    if not resource:
+        return ""
+    segments = urlparse(resource).path.strip("/").split("/")
+    if len(segments) == 2 and segments[1] == "mcp":
+        return segments[0]
+    return ""
 
 
 def _build_email(to: str, subject: str, body: str, cc: str = "",
@@ -303,6 +337,7 @@ async def read_thread(thread_id: str) -> dict:
 async def send_email(to: str, subject: str, body: str, cc: str = "",
                      reply_to_message_id: str = "") -> dict:
     """Send an email. Use reply_to_message_id to reply within a thread."""
+    _require_write()
     thread_id = ""
     in_reply_to = ""
     references = ""
@@ -332,6 +367,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
 @mcp.tool
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
                      json={"message": {"raw": _build_email(to, subject, body, cc)}})
@@ -352,6 +388,7 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 @mcp.tool
 async def send_draft(draft_id: str) -> dict:
     """Send an existing Gmail draft."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/drafts/send", headers=_auth(),
                      json={"id": draft_id})
@@ -364,6 +401,7 @@ async def send_draft(draft_id: str) -> dict:
 async def update_draft(draft_id: str, to: str, subject: str, body: str,
                        cc: str = "") -> dict:
     """Replace the content of an existing Gmail draft."""
+    _require_write()
     c = _client()
     r = await c.put(f"{GMAIL}/drafts/{draft_id}", headers=_auth(),
                     json={"message": {"raw": _build_email(to, subject, body, cc)}})
@@ -375,6 +413,7 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
 @mcp.tool
 async def delete_draft(draft_id: str) -> dict:
     """Permanently delete a Gmail draft."""
+    _require_write()
     c = _client()
     r = await c.delete(f"{GMAIL}/drafts/{draft_id}", headers=_auth())
     if r.status_code != 204:
@@ -396,6 +435,7 @@ async def list_labels() -> list[dict]:
 async def create_label(name: str, label_list_visibility: str = "labelShow",
                        message_list_visibility: str = "show") -> dict:
     """Create a new Gmail label."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/labels", headers=_auth(),
                      json={"name": name,
@@ -411,6 +451,7 @@ async def update_label(label_id: str, name: str | None = None,
                        label_list_visibility: str | None = None,
                        message_list_visibility: str | None = None) -> dict:
     """Rename or change visibility of an existing Gmail label."""
+    _require_write()
     body = {}
     if name is not None:
         body["name"] = name
@@ -428,6 +469,7 @@ async def update_label(label_id: str, name: str | None = None,
 @mcp.tool
 async def delete_label(label_id: str) -> dict:
     """Permanently delete a Gmail label."""
+    _require_write()
     c = _client()
     r = await c.delete(f"{GMAIL}/labels/{label_id}", headers=_auth())
     if r.status_code != 204:
@@ -440,6 +482,7 @@ async def delete_label(label_id: str) -> dict:
 async def modify_labels(message_id: str, add: list[str] | None = None,
                         remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
                      json={"addLabelIds": add or [], "removeLabelIds": remove or []})
@@ -450,6 +493,7 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
 @mcp.tool
 async def report_phishing(message_id: str) -> dict:
     """Mark a Gmail message as spam."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
                      json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
@@ -461,6 +505,7 @@ async def report_phishing(message_id: str) -> dict:
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
+    _require_write()
     c = _client()
     r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
     r.raise_for_status()
@@ -515,10 +560,14 @@ async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
 
 # ── OAuth endpoints ────────────────────────────────────────────────────────────
 
-def _base_oauth_metadata() -> dict:
+def _base_oauth_metadata(alias: str = "") -> dict:
+    # When discovery is reached through an alias, point authorization_endpoint at that
+    # alias's own /authorize. The alias then arrives as part of the request path rather
+    # than as a client-supplied parameter, so _authorize can trust it.
+    authorize = f"{BASE_URL}/{alias}/authorize" if alias else f"{BASE_URL}/authorize"
     return {
         "issuer": BASE_URL,
-        "authorization_endpoint": f"{BASE_URL}/authorize",
+        "authorization_endpoint": authorize,
         "token_endpoint": f"{BASE_URL}/token",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
@@ -527,16 +576,23 @@ def _base_oauth_metadata() -> dict:
 
 
 async def _oauth_server_metadata(req: Request) -> JSONResponse:
-    return JSONResponse({**_base_oauth_metadata(), "scopes_supported": ["gmail"]})
+    alias = getattr(req.state, "alias", "")
+    return JSONResponse({**_base_oauth_metadata(alias), "scopes_supported": ["gmail"]})
 
 
 async def _openid_configuration(req: Request) -> JSONResponse:
-    return JSONResponse({**_base_oauth_metadata(), "scopes_supported": ["openid", "gmail"]})
+    alias = getattr(req.state, "alias", "")
+    return JSONResponse({**_base_oauth_metadata(alias),
+                         "scopes_supported": ["openid", "gmail"]})
 
 
 async def _protected_resource(req: Request) -> JSONResponse:
+    # Identify the actual protected resource (RFC 9728), including the alias it was
+    # reached through, rather than just the server root.
+    alias = getattr(req.state, "alias", "")
+    resource = f"{BASE_URL}/{alias}/mcp" if alias else f"{BASE_URL}/mcp"
     return JSONResponse({
-        "resource": BASE_URL,
+        "resource": resource,
         "authorization_servers": [BASE_URL],
     })
 
@@ -549,10 +605,21 @@ async def _authorize(req: Request):
     if not p.get("code_challenge"):
         return Response("PKCE code_challenge is required", status_code=400)
 
+    # Prefer the alias from our own path (/work/authorize); fall back to the RFC 8707
+    # resource parameter for clients that only ever fetch unaliased discovery metadata.
+    # Either way this only narrows the Google grant — enforcement at request time keys
+    # off the path alias, so a client that sends neither cannot obtain write access to a
+    # read-only alias.
+    alias = getattr(req.state, "alias", "") or _alias_from_resource(p.get("resource"))
+    read_only = alias in READ_ONLY_ALIASES
+    log.info("authorize: alias=%r -> %s", alias,
+             "read-only" if read_only else "read-write")
+
     our_state = secrets.token_urlsafe(16)
     _state_store[our_state] = {
         "client_state": p.get("state"),
         "client_redirect_uri": redirect_uri,
+        "read_only": read_only,
         "code_challenge": p.get("code_challenge"),
         "created": time.time(),
     }
@@ -561,7 +628,7 @@ async def _authorize(req: Request):
             "client_id": GOOGLE_CLIENT_ID,
             "redirect_uri": f"{BASE_URL}/auth/callback",
             "response_type": "code",
-            "scope": GOOGLE_SCOPES,
+            "scope": _google_scopes(read_only),
             "state": our_state,
             "access_type": "offline",
             "prompt": "consent",
@@ -607,6 +674,7 @@ async def _auth_callback(req: Request):
         "refresh_token": tokens.get("refresh_token"),
         "expiry": time.time() + tokens.get("expires_in", 3600),
         "email": userinfo.get("email"),
+        "read_only": state_data.get("read_only", False),
         # Provisional; replaced with the real 30-day expiry once /token mints the client JWT.
         # Ensures flows abandoned between here and /token still get purged.
         "jwt_exp": time.time() + STATE_TTL,
@@ -619,6 +687,7 @@ async def _auth_callback(req: Request):
         "code_challenge": state_data["code_challenge"],
         "client_redirect_uri": state_data["client_redirect_uri"],
         "client_state": state_data["client_state"],
+        "read_only": state_data.get("read_only", False),
         "created": time.time(),
     }
 
@@ -647,6 +716,7 @@ async def _token(req: Request) -> JSONResponse:
     token = jwt.encode({
         "jti": code_data["jti"],
         "email": code_data["email"],
+        "read_only": code_data.get("read_only", False),
         "iat": now,
         "exp": exp,
     }, JWT_SECRET, algorithm="HS256")
@@ -660,10 +730,13 @@ async def _token(req: Request) -> JSONResponse:
 
 # ── Bearer auth middleware (raw ASGI — preserves ContextVar across await) ──────
 
-_WWW_AUTH = (
-    f'Bearer realm="Gmail MCP", '
-    f'resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
-).encode()
+def _www_auth_header(alias: str = "") -> bytes:
+    # Point the challenge at the alias's own metadata document, so the alias survives
+    # the discovery round-trip and comes back to us on /authorize.
+    path = (f"/{alias}/.well-known/oauth-protected-resource" if alias
+            else "/.well-known/oauth-protected-resource")
+    return (f'Bearer realm="Gmail MCP", '
+            f'resource_metadata="{BASE_URL}{path}"').encode()
 
 _OAUTH_PATHS = frozenset([
     "/.well-known/oauth-authorization-server",
@@ -696,17 +769,21 @@ def _with_security_headers(send):
     return wrapped
 
 
-def _normalise_path(path: str) -> str:
+def _split_alias(path: str) -> tuple[str, str]:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
-    resolve the same as their unaliased routes — lets two Claude connectors share one server."""
+    resolve the same as their unaliased routes — lets two Claude connectors share one
+    server. Returns (alias, normalised_path); alias is "" when there wasn't one.
+
+    The alias comes from the request path, which only this server controls — that is what
+    makes the READ_ONLY_ALIASES check below unspoofable by a client."""
     if path in _KNOWN_PATHS or path.startswith("/mcp/"):
-        return path
+        return "", path
     segments = path.lstrip("/").split("/", 1)
     if len(segments) == 2:
         candidate = "/" + segments[1]
         if candidate in _KNOWN_PATHS or candidate.startswith("/mcp/"):
-            return candidate
-    return path
+            return segments[0], candidate
+    return "", path
 
 
 class _App:
@@ -744,34 +821,43 @@ class _App:
             except Exception:
                 log.exception("periodic cleanup failed")
 
-            path = _normalise_path(scope["path"])
+            alias, path = _split_alias(scope["path"])
             if path != scope["path"]:
                 scope = {**scope, "path": path, "raw_path": path.encode()}
+            # Starlette route handlers read this via req.state.alias to echo the alias
+            # back into the OAuth discovery documents.
+            scope["state"] = {**(scope.get("state") or {}), "alias": alias}
 
             # Auth check for MCP endpoint only
             if path == "/mcp" or path.startswith("/mcp/"):
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode()
                 if not auth.startswith("Bearer "):
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 try:
                     payload = jwt.decode(auth[7:], JWT_SECRET, algorithms=["HS256"])
                     google_tok = await _google_access_token(payload["jti"])
                 except jwt.PyJWTError as e:
                     log.info("rejected MCP request: invalid/expired JWT (%s)", e)
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 except ReauthRequired as e:
                     log.warning("MCP request needs re-auth: %s", e)
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 except Exception:
                     log.exception("unexpected error validating MCP request")
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 _google_token.set(google_tok)
                 _user_email.set(payload.get("email", ""))
+                # Read-only if the grant was issued read-only OR this request came in
+                # through a read-only alias. The second half is the load-bearing one:
+                # it is derived from our own routing, so it holds even if the OAuth
+                # grant was somehow issued with write scopes.
+                _read_only.set(bool(payload.get("read_only", False))
+                               or alias in READ_ONLY_ALIASES)
 
             if path in _OAUTH_PATHS:
                 await self._oauth(scope, receive, send)
@@ -780,10 +866,10 @@ class _App:
         await self._mcp(scope, receive, send)
 
     @staticmethod
-    async def _send_401(send) -> None:
+    async def _send_401(send, alias: str = "") -> None:
         await send({"type": "http.response.start", "status": 401,
                     "headers": [(b"content-type", b"text/plain"),
-                                (b"www-authenticate", _WWW_AUTH)]})
+                                (b"www-authenticate", _www_auth_header(alias))]})
         await send({"type": "http.response.body", "body": b"Unauthorized"})
 
 

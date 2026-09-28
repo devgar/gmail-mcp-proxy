@@ -166,6 +166,7 @@ Click **Connect** and authenticate with your Google account.
 | `BASE_URL` | Public base URL, e.g. `https://example.com/gmail` (no trailing slash) |
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
+| `READ_ONLY_ALIASES` | Optional. Comma-separated connector aliases (e.g. `work`) restricted to read-only — no send, draft, label changes, or trash. See below. |
 
 ## Development
 
@@ -183,6 +184,35 @@ Tests mock all Gmail/Calendar API calls (via `respx`) and cover the pure-logic h
 (PKCE, alias path normalisation, MIME building) plus the behaviour that's easy to get
 wrong — deeply nested MIME bodies, reply threading, token-refresh races and revoked
 refresh tokens, and expiry-based store cleanup. No live Google credentials needed.
+
+## Read-only accounts
+
+To connect an account Claude should only ever read from, add its alias to
+`READ_ONLY_ALIASES` — e.g. `READ_ONLY_ALIASES=work` for a connector added at
+`/work/mcp`. Two independent things then happen:
+
+1. **Enforcement** (always applies). Any request arriving at `/work/mcp` is treated as
+   read-only and the write tools refuse with a clear error. This is decided from the
+   request path, which only this server controls — so it holds regardless of what the
+   client sends, and regardless of what scopes the session was originally granted.
+2. **Scope minimisation** (best effort). That alias's Google OAuth grant asks only for
+   `gmail.readonly`/`calendar.readonly`, so Google itself rejects writes and no write
+   token ever exists for the account. This needs the alias to reach `/authorize`, which
+   happens via the alias-scoped `authorization_endpoint` this server advertises, or via
+   the standard OAuth `resource` parameter as a fallback.
+
+The split matters: if a client ignores both discovery hints, the Google grant may end up
+with write scopes — but the connector is *still* refused writes by (1). The restriction
+degrades from two layers to one, never to none.
+
+To confirm which mode a connection got, check the log line emitted when you connect:
+
+```
+authorize: alias='work' -> read-only
+```
+
+If it says `read-write` for an alias you listed, scope minimisation didn't apply for that
+connection — enforcement still will, and reconnecting usually fixes it.
 
 ## Notes
 

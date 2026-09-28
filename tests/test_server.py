@@ -337,3 +337,78 @@ async def test_search_emails_clamps_enrich_limit_to_ceiling():
     await server.search_emails("q", enrich_limit=500)
 
     assert detail.call_count == server.SEARCH_ENRICH_MAX
+
+
+# ── read-only enforcement ─────────────────────────────────────────────────────
+
+WRITE_TOOL_CALLS = [
+    ("send_email", lambda: server.send_email("a@example.com", "s", "b")),
+    ("create_draft", lambda: server.create_draft("a@example.com", "s", "b")),
+    ("send_draft", lambda: server.send_draft("d1")),
+    ("update_draft", lambda: server.update_draft("d1", "a@example.com", "s", "b")),
+    ("delete_draft", lambda: server.delete_draft("d1")),
+    ("create_label", lambda: server.create_label("L")),
+    ("update_label", lambda: server.update_label("L1", name="x")),
+    ("delete_label", lambda: server.delete_label("L1")),
+    ("modify_labels", lambda: server.modify_labels("m1", add=["INBOX"])),
+    ("report_phishing", lambda: server.report_phishing("m1")),
+    ("trash_message", lambda: server.trash_message("m1")),
+]
+
+
+@pytest.mark.parametrize("name,call", WRITE_TOOL_CALLS, ids=[n for n, _ in WRITE_TOOL_CALLS])
+@respx.mock
+async def test_every_write_tool_is_refused_when_read_only(name, call):
+    # respx with no routes registered: any escaping HTTP call fails the test loudly
+    # rather than silently passing because nothing was mocked.
+    server._read_only.set(True)
+    try:
+        with pytest.raises(PermissionError):
+            await call()
+    finally:
+        server._read_only.set(False)
+
+
+READ_TOOL_NAMES = ["get_profile", "search_emails", "read_message", "read_thread",
+                   "list_drafts", "list_labels", "list_calendars", "list_events",
+                   "search_events", "get_event"]
+
+
+def _module_functions_calling_guard():
+    """Names of module-level functions whose source calls _require_write().
+
+    @mcp.tool returns the function unchanged, so the tools are plain functions here.
+    """
+    import inspect
+    found = set()
+    for name in dir(server):
+        fn = getattr(server, name)
+        if not inspect.isfunction(fn) or name == "_require_write":
+            continue
+        try:
+            src = inspect.getsource(fn)
+        except (OSError, TypeError):
+            continue
+        if "_require_write()" in src:
+            found.add(name)
+    return found
+
+
+def test_read_tools_are_not_guarded():
+    # Guard the guard: if someone adds _require_write() to a read tool, a read-only
+    # connector silently loses read access, which defeats the point of the feature.
+    guarded = _module_functions_calling_guard()
+    assert guarded, "introspection found no guarded functions — this check is vacuous"
+    for name in READ_TOOL_NAMES:
+        assert name not in guarded, f"{name} must stay usable read-only"
+
+
+def test_write_tool_list_matches_the_guarded_functions():
+    # If a new write tool is added without a guard, this fails rather than the gap
+    # going unnoticed until someone tries it on a read-only connector.
+    expected = {n for n, _ in WRITE_TOOL_CALLS}
+    guarded = _module_functions_calling_guard()
+    assert guarded == expected, (
+        f"guarded tools changed; update WRITE_TOOL_CALLS. "
+        f"unguarded-in-test={expected - guarded} ungathered-in-code={guarded - expected}"
+    )
