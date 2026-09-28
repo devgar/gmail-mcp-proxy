@@ -41,6 +41,15 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
 
+# How many search_emails results get metadata fetched for them. The ceiling is a quota
+# guard: per-user Gmail allows 6,000 units/minute, messages.get costs 20 and
+# messages.list 5, so 100 enriched results is ~2,005 units — roughly three such searches
+# a minute. The default is far lower because the binding cost in practice isn't quota,
+# it's that every enriched result takes up space in the reply before the caller knows
+# which results actually matter. Callers that want more can ask (see search_emails).
+SEARCH_ENRICH_DEFAULT = 25
+SEARCH_ENRICH_MAX = 100
+
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
 # the victim completes Google's consent screen, receive the resulting single-use code
@@ -195,13 +204,52 @@ async def get_profile() -> dict:
 
 
 @mcp.tool
-async def search_emails(query: str, max_results: int = 20) -> list[dict]:
-    """Search Gmail. Supports all Gmail search operators (from:, subject:, has:attachment, etc.)."""
+async def search_emails(query: str, max_results: int = 20,
+                        enrich_limit: int = SEARCH_ENRICH_DEFAULT) -> list[dict]:
+    """Search Gmail. Supports all Gmail search operators (from:, subject:, has:attachment, etc.).
+
+    Gmail's list endpoint only ever returns id/threadId, so the first `enrich_limit`
+    results are additionally fetched with from/to/subject/date/snippet/labels — enough
+    to answer most follow-up questions without a separate read_message call. Results
+    beyond that come back as bare id/threadId. Raise enrich_limit for a broad search
+    you intend to summarise; lower it (or pass 0) when you only need message ids, since
+    each enriched result costs both a Gmail API call and space in the reply.
+    """
     c = _client()
     r = await c.get(f"{GMAIL}/messages", headers=_auth(),
                     params={"q": query, "maxResults": max_results})
     r.raise_for_status()
-    return r.json().get("messages", [])
+    messages = r.json().get("messages", [])
+
+    limit = max(0, min(enrich_limit, SEARCH_ENRICH_MAX))
+    to_enrich, rest = messages[:limit], messages[limit:]
+
+    async def _enrich(msg: dict) -> dict:
+        try:
+            er = await c.get(f"{GMAIL}/messages/{msg['id']}", headers=_auth(),
+                             params={"format": "metadata",
+                                     "metadataHeaders": ["From", "To", "Subject", "Date"]})
+        except httpx.HTTPError:
+            # Network-level failure (timeout, connection reset, etc.) for this one
+            # message — degrade to bare id/threadId rather than failing the whole
+            # search, same as the is_success check below does for HTTP errors.
+            return msg
+        if not er.is_success:
+            return msg
+        data = er.json()
+        hdrs = {h["name"]: h["value"] for h in data.get("payload", {}).get("headers", [])}
+        return {
+            **msg,
+            "from": hdrs.get("From", ""),
+            "to": hdrs.get("To", ""),
+            "subject": hdrs.get("Subject", ""),
+            "date": hdrs.get("Date", ""),
+            "snippet": data.get("snippet", ""),
+            "labels": data.get("labelIds", []),
+        }
+
+    enriched = await asyncio.gather(*(_enrich(m) for m in to_enrich))
+    return list(enriched) + rest
 
 
 @mcp.tool
